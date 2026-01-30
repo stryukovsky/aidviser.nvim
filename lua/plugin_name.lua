@@ -7,7 +7,7 @@ local async = require("plenary.async")
 ---@field prompt string Promt to send
 ---@field model string model to use
 local config = {
-  prompt = "Hello!",
+  prompt = "You are developer vast knowledge on secure and fast code. You need to find flaws in code attached. You MUST provide response with only json array with entries with keys 1) startColumn 2) startLine 3) endColumn 4) endLine 5) message \n--- Document Start ---\n#{buffer}\n--- Document End ---",
   model = "qwen2.5-coder:14b",
   provider = "ollama",
   endpoint = "http://localhost:11434/api/chat",
