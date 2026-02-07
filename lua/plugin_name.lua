@@ -2,6 +2,11 @@
 local module = require("plugin_name.module")
 local curl = require("plenary.curl")
 local async = require("plenary.async")
+local log = require("plenary.log").new({
+  plugin = "plugin_name",
+  use_console = false,
+  level = "info",
+})
 
 ---@class Config
 ---@field prompt string Prompt to send
@@ -11,7 +16,8 @@ local async = require("plenary.async")
 -- string provider type
 ---@field endpoint string where to send requests
 local config = {
-  prompt = "You are developer vast knowledge on secure and fast code. You need to find flaws in code attached. You MUST provide response with only json array with entries with keys 1) startColumn 2) startLine 3) endColumn 4) endLine 5) message \n--- Document Start ---\n#{buffer}\n--- Document End ---",
+  ollama_prompt = "You are developer vast knowledge on secure and fast code. You need to find flaws in code attached. You MUST provide response with only json array with entries with keys 1) line, ALWAYS INTEGER NUMBER 2) message, ALWAYS LATIN STRING NO QUOTES OR OTHER NON ALPHANUMERIC SYMBOLS\n--- Document Start ---\n#{buffer}\n--- Document End --- You MUST check correctness of numeration of lines in your response. You MUST consider first line after Document start marker as first line in your response. ",
+  openai_prompt = "You are developer vast knowledge on secure and fast code. You need to find flaws in code attached. In this code every line has its number written AT THE VERY START of line. You MUST provide response STRICTLY in format <number of line> <text of diagnostic message>. ONE DIAGNOSTIC ON ONE LINE. ALWAYS LATIN STRING NO QUOTES OR OTHER NON ALPHANUMERIC SYMBOLS\n--- Document Start ---\n#{buffer}\n--- Document End --- You MUST check correctness of numeration of lines in your response. You MUST CHECK ONLY SEVERE STUFF, DO NOT GENERATE WAY TOO MANY WARNINGS. WRITE WARNINGS ONLY RELATED TO: 1) CONCURRENCY 2) POSSIBLE REFACTORING ISSUE 3) PERFORMANCE 4) SECURITY 5) MEMORY LEAKS. You MUST ignore LINTING, FORMATTING and other MINOR ISSUES. NEVER QUOTE CODE LINE ENTIRELY. YOUR RESPONSE MUST BE IN ONE LINE. You MUST consider first line after Document start marker as first line in your response. ",
   model = "qwen2.5-coder:14b",
   provider = "ollama",
   credential_env_name = "",
@@ -57,24 +63,28 @@ local function set_diagnostics(diagnostics_data, bufnr)
     end
 
     -- Convert to 0-indexed (Neovim uses 0-indexed, but most editors show 1-indexed)
-    local start_line = (entry.startLine or 1) - 1
-    local start_col = (entry.startColumn or 1) - 1
-    local end_line = (entry.endLine or entry.startLine or 1) - 1
-    local end_col = (entry.endColumn or entry.startColumn or 1) - 1
+    local start_line = math.max(0, (entry.line or 1) - 2)
+    local start_col = 0
+    local end_line = start_line
+    local end_col = 0
+    -- local start_line = (entry.startLine or 1) - 1
+    -- local start_col = (entry.startColumn or 1) - 1
+    -- local end_line = (entry.endLine or entry.startLine or 1) - 1
+    -- local end_col = (entry.endColumn or entry.startColumn or 1) - 1
 
     -- Ensure valid range
-    if start_line < 0 then
-      start_line = 0
-    end
-    if start_col < 0 then
-      start_col = 0
-    end
-    if end_line < start_line then
-      end_line = start_line
-    end
-    if end_col < start_col then
-      end_col = start_col
-    end
+    -- if start_line < 0 then
+    --   start_line = 0
+    -- end
+    -- if start_col < 0 then
+    --   start_col = 0
+    -- end
+    -- if end_line < start_line then
+    --   end_line = start_line
+    -- end
+    -- if end_col < start_col then
+    --   end_col = start_col
+    -- end
 
     -- Prepend model name to message
     local message = string.format("[%s] %s", M.config.model, entry.message)
@@ -98,21 +108,37 @@ local function set_diagnostics(diagnostics_data, bufnr)
   vim.notify(string.format("Set %d diagnostic(s) in buffer %d", #diagnostics, bufnr), vim.log.levels.INFO)
 end
 
-local function request(prompt, opts)
+local function request(opts, source)
   if opts.provider == "ollama" then
+    local body = table.concat(source, "\n")
+    if opts.ollama_prompt:match("#{buffer}") then
+      body = opts.ollama_prompt:gsub("#{buffer}", "\n\n" .. body .. "\n\n")
+    end
     return vim.json.encode({
       model = opts.model,
-      prompt = prompt,
+      prompt = body,
       stream = false,
     })
   end
   if opts.provider == "openai" then
+    local lines = {}
+    for i, text in ipairs(source) do
+      table.insert(lines, string.format("%d %s", i, text))
+    end
+    local body = table.concat(lines, "\n")
+    if opts.openai_prompt:match("#{buffer}") then
+      body = opts.openai_prompt:gsub("#{buffer}", "\n\n" .. body .. "\n\n")
+    end
+    log.info("openai request body")
+    log.info(body)
+    local msg_prompt = { role = "user", content = body }
     return vim.json.encode({
       model = opts.model,
-      prompt = prompt,
+      messages = { msg_prompt },
       stream = false,
     })
   end
+  vim.notify(string.format("Request cannot be performed, unknown provider %s", opts.provider), vim.log.levels.ERROR)
 end
 
 local function handle_response(opts, response)
@@ -120,64 +146,23 @@ local function handle_response(opts, response)
     return response.response
   end
   if opts.provider == "openai" then
-    return response.choices[0].message.content
+    return response.choices[1].message.content
   end
 end
 
-local function validate_response(opts, response)
-  -- Check if response exists
-  if not response then
-    vim.notify("Response is nil", vim.log.levels.WARN)
-    return false
+local function parseNumberedList(text)
+  local items = {}
+  for line in text:gmatch("[^\r\n]+") do
+    -- Match lines starting with "number<space>..." (e.g. "1 Improve readability")
+    local num, msg = line:match("^%s*(%d+)%s+(.+)$")
+    if num and msg then
+      table.insert(items, {
+        line = tonumber(num),
+        message = msg,
+      })
+    end
   end
-
-  -- Check if response is a table
-  if type(response) ~= "table" then
-    vim.notify("Response is not a table", vim.log.levels.WARN)
-    return false
-  end
-
-  -- Validate based on provider
-  if opts.provider == "ollama" then
-    if not response.response then
-      vim.notify("Ollama response missing 'response' field", vim.log.levels.WARN)
-      return false
-    end
-    if type(response.response) ~= "string" then
-      vim.notify("Ollama response.response is not a string", vim.log.levels.WARN)
-      return false
-    end
-  elseif opts.provider == "openai" then
-    if not response.choices then
-      vim.notify("OpenAI response missing 'choices' field", vim.log.levels.WARN)
-      return false
-    end
-    if type(response.choices) ~= "table" then
-      vim.notify("OpenAI response.choices is not a table", vim.log.levels.WARN)
-      return false
-    end
-    if not response.choices[1] then
-      vim.notify("OpenAI response.choices is empty", vim.log.levels.WARN)
-      return false
-    end
-    if not response.choices[1].message then
-      vim.notify("OpenAI response.choices[1] missing 'message' field", vim.log.levels.WARN)
-      return false
-    end
-    if not response.choices[1].message.content then
-      vim.notify("OpenAI response.choices[1].message missing 'content' field", vim.log.levels.WARN)
-      return false
-    end
-    if type(response.choices[1].message.content) ~= "string" then
-      vim.notify("OpenAI response.choices[1].message.content is not a string", vim.log.levels.WARN)
-      return false
-    end
-  else
-    vim.notify("Unknown provider: " .. tostring(opts.provider), vim.log.levels.WARN)
-    return false
-  end
-
-  return true
+  return items
 end
 
 ---@param args table? Optional parameters to override config
@@ -190,16 +175,6 @@ M.send_request = function(args, callback)
 
   -- Get current buffer contents
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  local buffer_content = table.concat(lines, "\n")
-
-  -- Replace #{buffer} placeholder with actual buffer contents
-  -- Separated by two newlines before and after
-  local prompt = opts.prompt
-  if prompt:match("#{buffer}") then
-    prompt = prompt:gsub("#{buffer}", "\n\n" .. buffer_content .. "\n\n")
-  end
-
-  -- Prepare the request body for Ollama chat API
 
   -- Try to use fidget.nvim if available
   local has_fidget, fidget = pcall(require, "fidget")
@@ -221,19 +196,19 @@ M.send_request = function(args, callback)
       ["Content-Type"] = "application/json",
     }
 
-    if opts.credential_env_name then
-      vim.print(opts.credential_env_name)
-      -- vim.print(os.getenv(opts.credential_env_name))
-      headers = {
-        ["Content-Type"] = "application/json",
-        ["Authorization"] = "Bearer " ..  os.getenv(opts.credential_env_name),
-      }
-    end
+    -- if opts.credential_env_name then
+    --   vim.print(opts.credential_env_name)
+    --   -- vim.print(os.getenv(opts.credential_env_name))
+    --   headers = {
+    --     ["Content-Type"] = "application/json",
+    --     ["Authorization"] = "Bearer " ..  os.getenv(opts.credential_env_name),
+    --   }
+    -- end
     curl.post(opts.endpoint, {
       headers = {
         ["Content-Type"] = "application/json",
       },
-      body = request(opts, prompt),
+      body = request(opts, lines),
       timeout = 12000,
       callback = vim.schedule_wrap(function(response)
         -- Update progress
@@ -273,16 +248,16 @@ M.send_request = function(args, callback)
         end
 
         -- Extract diagnostics from response and set them
-        if validate_response(opts, parsed) then
+        if true then
           local content = handle_response(opts, parsed)
 
           -- Check if content is wrapped in markdown code block
-          local json_content = content
+          local parsed_content = content
           local markdown_pattern = "```json%s*(.-)%s*```"
           local extracted = content:match(markdown_pattern)
 
           if extracted then
-            json_content = extracted
+            parsed_content = extracted
           end
 
           -- Update progress
@@ -290,26 +265,29 @@ M.send_request = function(args, callback)
             progress_handle:report({ message = "Setting diagnostics..." })
           end
 
+          log.info(parsed_content)
+          local diagnostics_data = parseNumberedList(parsed_content)
+
+          set_diagnostics(diagnostics_data, bufnr)
           -- Try to parse the content as JSON (assuming AI returns JSON array)
-          vim.print(json_content)
-          local diag_ok, diagnostics_data = pcall(vim.json.decode, json_content)
+          -- local diag_ok, diagnostics_data = pcall(vim.json.decode, parsed_content)
 
-          if diag_ok and type(diagnostics_data) == "table" then
-            -- Set diagnostics for the original buffer
-            set_diagnostics(diagnostics_data, bufnr)
-
-            -- Finish progress with success
-            if progress_handle then
-              progress_handle:finish()
-            end
-          else
-            vim.notify("Response does not contain valid diagnostics JSON", vim.log.levels.WARN)
-
-            -- Finish progress
-            if progress_handle then
-              progress_handle:finish()
-            end
-          end
+          -- if diag_ok and type(diagnostics_data) == "table" then
+          --   -- Set diagnostics for the original buffer
+          --
+          --   -- Finish progress with success
+          --   if progress_handle then
+          --     progress_handle:finish()
+          --   end
+          -- else
+          --   vim.notify("Response does not contain valid diagnostics JSON", vim.log.levels.WARN)
+          --   vim.notify(json_content, vim.log.levels.WARN)
+          --
+          --   -- Finish progress
+          --   if progress_handle then
+          --     progress_handle:finish()
+          --   end
+          -- end
         else
           -- Finish progress
           if progress_handle then
